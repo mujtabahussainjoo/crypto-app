@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-import os, json, time, threading, webbrowser, http.server, socketserver
+import os, json, time, threading, webbrowser, http.server, socketserver, socket
 import urllib.error, urllib.parse, math, re
 from concurrent.futures import ThreadPoolExecutor
 from urllib.request import Request, urlopen
 from urllib.parse import urlencode
 
-PORT = 8765
+# AFTER
+DEFAULT_PORT = 8765
+PORT_RANGE   = 20       # scans 8765 → 8784
+PORT         = DEFAULT_PORT  # resolved at runtime in main()
 BASE_DIR  = os.path.dirname(os.path.abspath(__file__))
 HTML_FILE = os.path.join(BASE_DIR, 'dashboard.html')
 COINGECKO_BASE  = 'https://api.coingecko.com/api/v3'
 DERIBIT_BASE    = 'https://www.deribit.com/api/v2'
 FALLBACK_INR_RATE = 83.5
-LLM_API_KEY  = os.environ.get('LLM_API_KEY') or ''
-LLM_MODEL    = os.environ.get('LLM_MODEL', 'grok-1.5')
-LLM_ENDPOINT = os.environ.get('LLM_ENDPOINT', 'https://api.x.ai/v1/chat/completions')
+LLM_API_KEY  = os.environ.get('GROQ_API_KEY')
+if not LLM_API_KEY:
+    raise EnvironmentError(
+        "❌ GROQ_API_KEY environment variable not set!\n"
+        "Set it with: export GROQ_API_KEY='your_new_key_here'\n"
+        "Or add to ~/.bashrc: export GROQ_API_KEY='your_new_key_here'"
+    )
+LLM_MODEL    = os.environ.get('LLM_MODEL', 'llama-3.3-70b-versatile')  # ✅ Best Groq model [web:page]
+LLM_ENDPOINT = os.environ.get('LLM_ENDPOINT', 'https://api.groq.com/openai/v1/chat/completions')
 LLM_ENABLED  = os.environ.get('LLM_ENABLED', '1') in ('1', 'true', 'True')
 CACHE = {}
 CACHE_LOCK = threading.Lock()
@@ -276,14 +285,39 @@ def build_composite_sentiment(coin_id, meta, chart, options=None):
     return {'score':round(score,2),'label':label,'source':'Composite fear-greed model','drivers':drivers}
 
 def query_llm(messages):
-    if not LLM_ENABLED or not LLM_API_KEY: return None
-    payload=json.dumps({'model':LLM_MODEL,'messages':messages,'temperature':0.7,'max_tokens':500}).encode('utf-8')
-    req=Request(LLM_ENDPOINT,data=payload,headers={'Content-Type':'application/json','Authorization':f'Bearer {LLM_API_KEY}'})
+    if not LLM_ENABLED or not LLM_API_KEY: 
+        return None
+    
+    payload = json.dumps({
+        'model': LLM_MODEL,
+        'messages': messages,
+        'temperature': 0.7,
+        'max_tokens': 500
+    }).encode('utf-8')
+    
+    req = Request(
+        LLM_ENDPOINT,
+        data=payload,
+        headers={
+            'Content-Type': 'application/json',
+            'Authorization': f'Bearer {LLM_API_KEY}',
+            'User-Agent': 'CryptoLens/2.0'
+        }
+    )
+    
     try:
-        with urlopen(req,timeout=20) as r:
-            data=json.loads(r.read().decode('utf-8')); choices=data.get('choices') or []
-            return choices[0].get('message',{}).get('content') if choices else None
-    except Exception: return None
+        with urlopen(req, timeout=20) as r:
+            data = json.loads(r.read().decode('utf-8'))
+            choices = data.get('choices') or []
+            if choices:
+                return choices[0].get('message', {}).get('content')
+            return None
+    except urllib.error.HTTPError as e:
+        print(f"🔴 Groq API Error: {e.code} - {e.read().decode('utf-8')}")
+        return None
+    except Exception as exc:
+        print(f"🔴 Groq API Error: {exc}")
+        return None
 
 def sma(values, n):
     out = []
@@ -365,10 +399,42 @@ def build_coindata(coin_id, options_enabled=True):
     }
 
 def mybuddy_reply(coin_id, question, meta, price, sentiment):
-    if not LLM_ENABLED: return {'reply':'MyBuddy disabled (LLM_ENABLED=0).','source':'Disabled','model':None}
-    answer=query_llm([{'role':'system','content':'You are MyBuddy, a crypto research assistant. Be concise. This is not financial advice.'},{'role':'user','content':f"Analyze {meta.get('name')} ({normalize_symbol(meta.get('symbol'))}) at ${price.get('usd'):.4f}, 24h {price.get('usd_24h_change'):+.2f}%, sentiment {sentiment.get('score'):.1f}. Question: {question}"}])
-    return {'reply':answer.strip(),'source':'LLM','model':LLM_MODEL} if answer else {'reply':'LLM_API_KEY missing or unreachable.','source':'Fallback','model':None}
-
+    if not LLM_ENABLED: 
+        return {
+            'reply': 'MyBuddy disabled (LLM_ENABLED=0).',
+            'source': 'Disabled',
+            'model': None
+        }
+    
+    messages = [
+        {
+            'role': 'system',
+            'content': 'You are MyBuddy, a crypto research assistant. Be concise. This is not financial advice.'
+        },
+        {
+            'role': 'user',
+            'content': (
+                f"Analyze {meta.get('name')} ({normalize_symbol(meta.get('symbol'))}) "
+                f"at ${price.get('usd'):.4f}, 24h {price.get('usd_24h_change'):+.2f}%, "
+                f"sentiment {sentiment.get('score'):.1f}. Question: {question}"
+            )
+        }
+    ]
+    
+    answer = query_llm(messages)
+    
+    if answer:
+        return {
+            'reply': answer.strip(),
+            'source': 'LLM (Grok)',
+            'model': LLM_MODEL
+        }
+    else:
+        return {
+            'reply': 'Grok API missing key or unreachable. Check XAI_API_KEY.',
+            'source': 'Fallback',
+            'model': None
+        }
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, *args): return
@@ -421,20 +487,50 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.send_response(404); self.send_header('Content-Type','application/json'); self.send_header('Content-Length',str(len(body))); self.end_headers(); self.wfile.write(body); return
         self.send_error(404)
 
+def find_available_port(start=DEFAULT_PORT, max_tries=PORT_RANGE):
+    for port in range(start, start + max_tries):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                s.bind(('', port))
+                return port       # free port found
+            except OSError:
+                continue          # port busy, try next
+    raise RuntimeError(f'No port free in range {start}–{start + max_tries - 1}.')
 
 def main():
+    global PORT
+    PORT = find_available_port()
+    if PORT != DEFAULT_PORT:
+        print(f' Note : Default port {DEFAULT_PORT} was busy → using port {PORT}')
+    
     load_top_coins(force=True)
-    print('\n'+'='*60+'\n CryptoLens - Updated Edition\n'+'='*60)
-    print(f' URL: http://localhost:{PORT}\n Coins: {len(TOP_COINS)}\n'+'='*60+'\n')
-    socketserver.TCPServer.allow_reuse_address=True
-    with socketserver.TCPServer(('',PORT),Handler) as server:
+    
+    print('\n' + '='*60)
+    print(' CryptoLens - Updated Edition with Grok AI')
+    print('='*60)
+    print(f' URL: http://localhost:{PORT}')
+    print(f' Coins: {len(TOP_COINS)}')
+    print(f' Grok Model: {LLM_MODEL}')
+    print(f' Grok Enabled: {LLM_ENABLED}')
+    print('='*60 + '\n')
+    
+    socketserver.TCPServer.allow_reuse_address = True
+    with socketserver.TCPServer(('', PORT), Handler) as server:
         def opener():
             time.sleep(1.2)
-            try: webbrowser.open(f'http://localhost:{PORT}')
-            except Exception: pass
-        threading.Thread(target=opener,daemon=True).start()
-        try: server.serve_forever()
-        except KeyboardInterrupt: print('\nServer stopped.\n')
+            try:
+                webbrowser.open(f'http://localhost:{PORT}')
+            except Exception:
+                pass
+        
+        threading.Thread(target=opener, daemon=True).start()
+        
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            print('\nServer stopped.\n')
 
-if __name__=='__main__':
+
+if __name__ == '__main__':
     main()
